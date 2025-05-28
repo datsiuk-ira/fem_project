@@ -120,7 +120,6 @@ class FEMApp(ctk.CTk):
 
     def launch_pyvista_thread(self):
         if self._pv_thread is None or not self._pv_thread.is_alive():
-            # Переконуємося, що старий плоттер (якщо був) закритий перед запуском нового потоку
             if self.pv_visualizer.plotter:
                 self.pv_visualizer.close_plotter()
 
@@ -131,46 +130,42 @@ class FEMApp(ctk.CTk):
             self._log_message("Потік PyVista вже активний.")
 
     def _pyvista_worker_loop(self):
-        """Головний цикл потоку PyVista: створює плоттер і обробляє команди з черги."""
         plotter_title = "3D FEM Візуалізація"
         try:
-            # Створюємо плоттер тут, в потоці PyVista
-            self.pv_visualizer.plotter = pv.Plotter(window_size=[800, 600], title=plotter_title)
+            self.pv_visualizer.plotter = pv.Plotter(
+                window_size=[800, 600],
+                title=plotter_title,
+            )
             if self.pv_visualizer._picking_enabled and self.pv_visualizer._picking_callback_gui:
                 self.pv_visualizer._register_picking_callback_pv()
-            self._log_message_from_thread("Плоттер PyVista створено в окремому потоці.")
-            self.pv_visualizer.is_active = True  # Плоттер створено
+
+            self._log_message_from_thread("Плоттер PyVista створено, запускаю вікно...")
+            self.pv_visualizer.plotter.show(interactive_update=True, auto_close=False)
+            self.pv_visualizer.is_active = True
+            self._log_message_from_thread("Вікно PyVista активне та очікує команд.")
+
         except Exception as e:
-            self._log_message_from_thread(f"Не вдалося створити плоттер PyVista: {e}")
+            self._log_message_from_thread(f"Не вдалося створити або показати плоттер PyVista: {e}")
             self.pv_visualizer.is_active = False
-            return  # Вихід з потоку, якщо плоттер не створено
+            return
 
-        # Запускаємо головний цикл PyVista (блокуючий для цього потоку)
-        # Це має бути зроблено ПІСЛЯ обробки першої команди на відображення,
-        # або ми можемо показати порожнє вікно спочатку.
-        # Краще показати порожнє вікно, щоб воно було готове.
-        # self.pv_visualizer.plotter.show(interactive=True, auto_close=False) # Не тут, бо блокує чергу
-
-        first_render_done = False
-
-        while self.pv_visualizer.is_active:  # Працюємо, поки вікно PyVista активне
+        while self.pv_visualizer.is_active:
             try:
                 command, args, kwargs = self._pv_command_queue.get(timeout=0.1)
 
                 if command == "stop":
                     self._log_message_from_thread("Команда stop для потоку PyVista.")
-                    self.pv_visualizer.is_active = False  # Сигнал на вихід з циклу
+                    self.pv_visualizer.is_active = False
                     break
 
                 if self.pv_visualizer.plotter and self.pv_visualizer.plotter.renderer:
-                    current_title = kwargs.get("title", self.pv_visualizer.plotter.title)
-                    self.pv_visualizer.plotter.title = current_title
+                    new_title = kwargs.get("title",
+                                           self.pv_visualizer.plotter.title if self.pv_visualizer.plotter.title else plotter_title)
+                    if self.pv_visualizer.plotter.title != new_title:
+                        self.pv_visualizer.plotter.title = new_title
+
+                    # Очищаємо акторів перед відображенням нової сцени
                     self.pv_visualizer.plotter.clear_actors()
-                    try:
-                        self.pv_visualizer.plotter.remove_actor("plot_title", render=False)
-                        self.pv_visualizer.plotter.remove_actor("status_message", render=False)
-                    except:
-                        pass
 
                     if command == "display_mesh":
                         self.pv_visualizer.display_mesh_to_plotter(*args, **kwargs)
@@ -180,53 +175,62 @@ class FEMApp(ctk.CTk):
                         self.pv_visualizer.display_scalar_field_to_plotter(*args, **kwargs)
                     elif command == "display_message":
                         self.pv_visualizer.display_message_on_plotter(*args, **kwargs)
-
-                    if not first_render_done:
-                        # Перший реальний показ, який запускає цикл подій VTK
-                        # Цей виклик має бути блокуючим для цього потоку.
-                        self.pv_visualizer.plotter.show(title=current_title, auto_close=False)
-                        # Після того, як show() завершиться (користувач закрив вікно),
-                        # is_active має стати False.
-                        self.pv_visualizer.is_active = False
-                        first_render_done = True  # Хоча ми вийдемо з циклу
-                        break  # Вихід з циклу, якщо вікно закрито
-                    else:
-                        # Якщо show() вже було викликано і вікно активне (що неможливо, якщо show() блокує до закриття)
-                        # Ця гілка, ймовірно, не потрібна при такому підході
-                        self.pv_visualizer.plotter.render()
-                else:  # Плоттер був закритий або не створений
-                    self._log_message_from_thread("Спроба оновити неіснуючий плоттер.")
+                else:
                     if command == "stop": break
+                    if self.pv_visualizer.plotter is None and self.pv_visualizer.is_active:
+                        self._log_message_from_thread("Плоттер PyVista більше не існує. Потік зупиняється.")
+                        self.pv_visualizer.is_active = False
 
                 self._pv_command_queue.task_done()
             except queue.Empty:
-                if not self.pv_visualizer.is_active:  # Перевіряємо, чи не надійшов сигнал про закриття
+                # Перевіряємо, чи вікно PyVista було закрито користувачем
+                # Атрибут 'closed' може бути відсутнім у деяких версіях/конфігураціях PyVista.
+                # Більш надійний спосіб - перевірити, чи рендерер ще існує.
+                plotter_still_open = False
+                if self.pv_visualizer.plotter and self.pv_visualizer.plotter.renderer:
+                    # PyVista вікна зазвичай встановлюють renderer в None при закритті,
+                    # або сам об'єкт plotter стає None після close_plotter.
+                    # self.pv_visualizer.plotter.window_ಬೇಕು() # Цей метод може не існувати або блокувати
+                    plotter_still_open = True  # Припускаємо, що відкритий, якщо об'єкт існує
+
+                if not plotter_still_open and self.pv_visualizer.is_active:
+                    # Якщо is_active все ще True, але плоттер виглядає закритим, оновлюємо стан
+                    self._log_message_from_thread("Вікно PyVista, схоже, було закрито користувачем.")
+                    self.pv_visualizer.is_active = False
+
+                if not self.pv_visualizer.is_active:
                     break
                 continue
+            except AttributeError as ae:
+                if "'Plotter' object has no attribute 'closed'" in str(ae):
+                    # Обробляємо помилку, якщо атрибут 'closed' не існує
+                    self._log_message_from_thread(
+                        "Атрибут 'plotter.closed' не знайдено. Перевірка закриття вікна може бути неповною.")
+                    # Продовжуємо роботу, але закриття вікна користувачем може не оброблятися коректно
+                else:
+                    self._log_message_from_thread(f"AttributeError в _pyvista_worker_loop: {ae}")
+                # Можна додати інші обробки помилок тут
             except Exception as e:
                 self._log_message_from_thread(f"Помилка в _pyvista_worker_loop: {e}")
                 import traceback
                 self._log_message_from_thread(traceback.format_exc())
 
-        if self.pv_visualizer.plotter:  # Закриваємо, якщо цикл завершився, а плоттер ще існує
+        if self.pv_visualizer.plotter:
             self.pv_visualizer.close_plotter()
         self._log_message_from_thread("_pyvista_worker_loop завершено.")
 
     def on_closing(self):
         self._log_message("Закриття додатку...")
+        self.pv_visualizer.is_active = False  # Встановлюємо прапорець для зупинки потоку PyVista
         if self._pv_thread and self._pv_thread.is_alive():
-            self._pv_command_queue.put(("stop", [], {}))
-            # Даємо потоку PyVista шанс закритися коректно
-            if self.pv_visualizer.plotter and self.pv_visualizer.is_active:
-                # Якщо вікно PyVista ще відкрите, його треба закрити з його потоку.
-                # Команда "stop" має це зробити.
-                pass
-            self._pv_thread.join(timeout=3)  # Чекаємо недовго
+            self._pv_command_queue.put(("stop", [], {}))  # Надсилаємо команду зупинки
+            self._pv_thread.join(timeout=2)  # Чекаємо завершення потоку
             if self._pv_thread.is_alive():
-                self._log_message("Потік PyVista не завершився коректно.")
+                self._log_message("Потік PyVista не завершився коректно вчасно.")
 
-        if self.pv_visualizer and self.pv_visualizer.plotter:  # Перевірка, чи потік не закрив
+        if self.pv_visualizer and self.pv_visualizer.plotter:  # Додаткова перевірка
             self.pv_visualizer.close_plotter()
+
         self.destroy()
 
     def _create_param_entry(self, parent, label_text, default_value, width=140):
@@ -269,7 +273,8 @@ class FEMApp(ctk.CTk):
         self.U_solution = None;
         self.stress_calculator = None
         self.plot_type_var.set("Початкова сітка")
-        self.update_plot_view_command()
+        # Запускаємо оновлення візуалізації після невеликої затримки, щоб GUI встиг обробити події
+        self.after(100, self.update_plot_view_command)
         if self.mesh_instance.nel > 0: self._log_message("Сітку згенеровано.")
 
     def assemble_global_system_fem(self):
@@ -283,7 +288,8 @@ class FEMApp(ctk.CTk):
             load_face_id = int(self.load_face_id_entry.get());
             pressure = float(self.pressure_entry.get())
         except ValueError:
-            self._log_message("Помилка: Некоректні параметри навантаження."); return
+            self._log_message("Помилка: Некоректні параметри навантаження.");
+            return
         self.element_calculators = {}
         for elem_idx in range(self.mesh_instance.nel):
             elem_node_coords = self.mesh_instance.get_element_nodes_coords(elem_idx)
@@ -293,8 +299,6 @@ class FEMApp(ctk.CTk):
             self.global_system.assemble_element(elem_idx, calculator.MGE, calculator.FE)
         end_time = time.time()
         self._log_message(f"Глобальну систему зібрано за {end_time - start_time:.3f} сек.")
-        self._log_message(
-            f"Норма MG: {np.linalg.norm(self.global_system.MG):.2e}, Норма F: {np.linalg.norm(self.global_system.F):.2e}")
         self.U_solution = None;
         self.stress_calculator = None
 
@@ -306,7 +310,8 @@ class FEMApp(ctk.CTk):
             fixed_face_id = int(self.fixed_face_id_entry.get())
             dofs_to_fix_flags = [bool(int(self.fixed_dof_vars[i].get())) for i in range(3)]
         except ValueError:
-            self._log_message("Помилка: Некоректні параметри закріплення."); return
+            self._log_message("Помилка: Некоректні параметри закріплення.");
+            return
         if fixed_face_id not in HEX_FACE_DEFINITIONS: self._log_message(
             f"Помилка: Неправильний ID фіксованої грані {fixed_face_id}."); return
 
@@ -321,22 +326,39 @@ class FEMApp(ctk.CTk):
                 target_global_coord_val = self.mesh_instance.ay
             else:
                 target_global_coord_val = self.mesh_instance.az
+
         fixed_global_node_indices = set()
         tolerance = 1e-6
         for node_idx in range(self.mesh_instance.nqp):
             node_coord = self.mesh_instance.AKT[node_idx, fixed_coord_idx]
             if abs(node_coord - target_global_coord_val) < tolerance: fixed_global_node_indices.add(node_idx)
+
         bc_info_list = []
         for global_node_idx in sorted(list(fixed_global_node_indices)):
             for dof_idx_in_node, should_fix in enumerate(dofs_to_fix_flags):
                 if should_fix: bc_info_list.append((global_node_idx, dof_idx_in_node, 0.0))
+
         if not bc_info_list: self._log_message("Не знайдено вузлів для закріплення."); return
+
         self.global_system.apply_boundary_conditions(bc_info_list)
         self._log_message(f"Застосовано ГУ для {len(bc_info_list)} ступенів свободи.")
-        self._log_message(f"Норма MG після ГУ: {np.linalg.norm(self.global_system.MG):.2e}")
-        self._log_message(f"Норма F після ГУ: {np.linalg.norm(self.global_system.F):.2e}")
         self.U_solution = None;
         self.stress_calculator = None
+
+    def _reconstruct_full_mg_from_banded(self, banded_mg: np.ndarray, num_dof: int, bandwidth_ng: int) -> np.ndarray:
+        """Допоміжна функція для реконструкції повної матриці MG зі стрічкового формату."""
+        full_mg = np.zeros((num_dof, num_dof))
+        # banded_mg[k, j] зберігає A_full[j-k, j] де k = j-i (індекс діагоналі)
+        # k - це band_row (0 для головної діагоналі)
+        for j_col in range(num_dof):  # Ітерація по стовпцях повної матриці
+            for band_row in range(bandwidth_ng):  # Ітерація по діагоналях, що зберігаються
+                i_row_full = j_col - band_row  # Рядок у повній матриці
+                if 0 <= i_row_full < num_dof:  # Перевіряємо, чи рядок в межах матриці
+                    value = banded_mg[band_row, j_col]
+                    full_mg[i_row_full, j_col] = value
+                    if i_row_full != j_col:  # Симетричне заповнення
+                        full_mg[j_col, i_row_full] = value
+        return full_mg
 
     def solve_fem_system(self):
         if not self.global_system or not hasattr(self.global_system, 'MG'):
@@ -344,7 +366,22 @@ class FEMApp(ctk.CTk):
             return
         self._log_message("\n--- Розв'язання системи ---")
         start_time = time.time()
-        self.U_solution = solve_system(self.global_system.MG, self.global_system.F)
+
+        if self.global_system.is_banded:
+            self._log_message("Реконструкція повної матриці MG зі стрічкової для розв'язання...")
+            # Переконуємося, що mesh_instance існує перед доступом до ng
+            if not self.mesh_instance:
+                self._log_message("Помилка: екземпляр сітки не створено, неможливо отримати ng.")
+                return
+            full_MG_reconstructed = self._reconstruct_full_mg_from_banded(
+                self.global_system.MG,
+                self.global_system.num_dof,
+                self.mesh_instance.ng
+            )
+            self.U_solution = solve_system(full_MG_reconstructed, self.global_system.F)
+        else:
+            self.U_solution = solve_system(self.global_system.MG, self.global_system.F)
+
         end_time = time.time()
         if self.U_solution is not None:
             self._log_message(f"Систему розв'язано за {end_time - start_time:.3f} сек.")
@@ -383,20 +420,15 @@ class FEMApp(ctk.CTk):
 
     def update_plot_view_command(self, selected_option=None):
         plot_type = self.plot_type_var.get()
-        self._log_message(f"Команда на оновлення візуалізації: {plot_type}")
-        args, kwargs = [], {}
-        command_str = "display_message"
+
         if not self.pv_visualizer.is_active and (self._pv_thread is None or not self._pv_thread.is_alive()):
-            self._log_message("Вікно PyVista не активне. Запускаю потік...")
-            self.launch_pyvista_thread()  # Спробувати запустити/перезапустити потік
-            # Можливо, варто додати невелику затримку перед відправкою команди
-            # self.after(500, lambda: self._send_pv_command(plot_type)) # Відкладена відправка
-            self._send_pv_command(plot_type)  # Відправляємо відразу, потік має обробити
+            self._log_message("Вікно PyVista не активне або потік не запущено. Запускаю потік...")
+            self.launch_pyvista_thread()
+            self.after(500, lambda pt=plot_type: self._send_pv_command(pt))
             return
         self._send_pv_command(plot_type)
 
     def _send_pv_command(self, plot_type: str):
-        """Формує та відправляє команду в чергу PyVista."""
         args, kwargs = [], {}
         command_str = "display_message"
         default_message_args = ["Оберіть тип візуалізації або виконайте попередні кроки."]
@@ -432,8 +464,9 @@ class FEMApp(ctk.CTk):
                             nqp = self.mesh_instance.AKT.shape[0]
                             displacements = self.U_solution.reshape((nqp, 3))
                             akt_to_display = self.mesh_instance.AKT + displacements * scale
-                        except:
+                        except ValueError:
                             pass
+
                     command_str = "display_scalar_field"
                     args = [akt_to_display, self.mesh_instance.NT,
                             self.stress_calculator.nodal_principal_stresses[:, stress_idx],
@@ -446,11 +479,10 @@ class FEMApp(ctk.CTk):
         else:
             args = default_message_args
 
-        if self._pv_thread and self._pv_thread.is_alive():
+        if self._pv_thread and self._pv_thread.is_alive() and self.pv_visualizer.is_active:
             self._pv_command_queue.put((command_str, args, kwargs))
-        else:
-            self._log_message(
-                "Потік PyVista не активний. Спробуйте перезапустити додаток або натиснути 'Оновити' ще раз після запуску.")
+        elif not (self._pv_thread and self._pv_thread.is_alive()):
+            self._log_message("Потік PyVista не активний. Спробуйте перезапустити додаток.")
 
     def gui_picking_callback_from_thread(self, node_id: int, picked_coords: np.ndarray,
                                          active_pv_mesh: pv.UnstructuredGrid):
@@ -458,16 +490,20 @@ class FEMApp(ctk.CTk):
         log_lines.append(f"\n--- Інформація про вибраний вузол ID: {node_id} ---")
         log_lines.append(
             f"Координати на графіку: [{picked_coords[0]:.3f}, {picked_coords[1]:.3f}, {picked_coords[2]:.3f}]")
+
         if self.mesh_instance and 0 <= node_id < self.mesh_instance.nqp:
             initial_coords = self.mesh_instance.AKT[node_id]
             log_lines.append(
                 f"Початкові координати: [{initial_coords[0]:.3f}, {initial_coords[1]:.3f}, {initial_coords[2]:.3f}]")
-        if self.U_solution is not None and 0 <= node_id < self.mesh_instance.nqp:
+
+        if self.U_solution is not None and self.mesh_instance and 0 <= node_id < self.mesh_instance.nqp:
             disp_x = self.U_solution[node_id * 3 + 0];
             disp_y = self.U_solution[node_id * 3 + 1];
             disp_z = self.U_solution[node_id * 3 + 2]
             log_lines.append(f"Переміщення (Ux,Uy,Uz): [{disp_x:.3e}, {disp_y:.3e}, {disp_z:.3e}]")
-        if self.stress_calculator and self.stress_calculator.nodal_stresses.size > 0 and 0 <= node_id < self.mesh_instance.nqp:
+
+        if self.stress_calculator and self.stress_calculator.nodal_stresses.size > 0 and \
+                self.mesh_instance and 0 <= node_id < self.mesh_instance.nqp:
             stresses = self.stress_calculator.nodal_stresses[node_id, :];
             p_stresses = self.stress_calculator.nodal_principal_stresses[node_id, :]
             log_lines.append(f"Напруження (xx,yy,zz,xy,yz,zx):")
@@ -475,6 +511,7 @@ class FEMApp(ctk.CTk):
             log_lines.append(f"   {stresses[3]:.3e}, {stresses[4]:.3e}, {stresses[5]:.3e}]")
             log_lines.append(f"Головні напруження (S1,S2,S3):")
             log_lines.append(f"  [{p_stresses[0]:.3e}, {p_stresses[1]:.3e}, {p_stresses[2]:.3e}]")
+
         self.after(0, lambda: self._log_message("\n".join(log_lines), clear_previous=True))
 
 
